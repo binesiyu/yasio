@@ -5,7 +5,7 @@
 /*
 The MIT License (MIT)
 
-Copyright (c) 2012-2019 halx99
+Copyright (c) 2012-2020 HALX99
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -32,62 +32,112 @@ SOFTWARE.
 #include <stdio.h>
 #include <stdarg.h>
 #include <string>
+#include "yasio/compiler/feature_test.hpp"
 
 namespace yasio
 {
-/*--- This is a C++ universal sprintf in the future.
- **  @pitfall: The behavior of vsnprintf between VS2013 and VS2015/2017 is
- *different
- **      VS2013 or Unix-Like System will return -1 when buffer not enough, but
- *VS2015/2017 will return the actural needed length for buffer at this station
- **      The _vsnprintf behavior is compatible API which always return -1 when
- *buffer isn't enough at VS2013/2015/2017
- **      Yes, The vsnprintf is more efficient implemented by MSVC 19.0 or later,
- *AND it's also standard-compliant, see reference:
- *http://www.cplusplus.com/reference/cstdio/vsnprintf/
- */
-inline std::string strfmt(size_t n, const char* format, ...)
+// yasio::format_traits: the vsnprintf/vswprintf wrapper
+// !!! if '_BufferCount' had been sufficiently large, not counting the terminating null character.
+template <typename _Elem> struct format_traits
+{};
+template <> struct format_traits<char>
+{
+  static int format(char* const _Buffer, size_t const _BufferCount, char const* const _Format,
+                    va_list _ArgList)
+  {
+    return vsnprintf(_Buffer, _BufferCount, _Format, _ArgList);
+  }
+  static const char* report_error() { return "yasio::_strfmt: an error is encountered!"; }
+};
+template <> struct format_traits<wchar_t>
+{
+  static int format(wchar_t* const _Buffer, size_t const _BufferCount, wchar_t const* const _Format,
+                    va_list _ArgList)
+  {
+    return vswprintf(_Buffer, _BufferCount, _Format, _ArgList);
+  }
+  static const wchar_t* report_error() { return L"yasio::_strfmt: an error is encountered!"; }
+};
+
+template <class _Elem, class _Traits = std::char_traits<_Elem>,
+          class _Alloc = std::allocator<_Elem>>
+inline std::basic_string<_Elem, _Traits, _Alloc> _vstrfmt(size_t n, const _Elem* format,
+                                                          va_list initialized_args)
 {
   va_list args;
-  std::string buffer(n, '\0');
+  std::basic_string<_Elem, _Traits, _Alloc> buf(n, 0);
 
-  va_start(args, format);
-  int nret = vsnprintf(&buffer.front(), buffer.length() + 1, format, args);
+  va_copy(args, initialized_args);
+  int nret = format_traits<_Elem>::format(&buf.front(), buf.length() + 1, format, args);
   va_end(args);
 
   if (nret >= 0)
   {
-    if ((unsigned int)nret < buffer.length())
+    if ((unsigned int)nret < buf.length())
     {
-      buffer.resize(nret);
+      buf.resize(nret);
     }
-    else if ((unsigned int)nret > buffer.length())
-    { // VS2015/2017 or later Visual Studio Version
-      buffer.resize(nret);
+    else if ((unsigned int)nret > buf.length())
+    { // handle return required length when buffer insufficient
+      buf.resize(nret);
 
-      va_start(args, format);
-      nret = vsnprintf(&buffer.front(), buffer.length() + 1, format, args);
+      va_copy(args, initialized_args);
+      nret = format_traits<_Elem>::format(&buf.front(), buf.length() + 1, format, args);
       va_end(args);
     }
     // else equals, do nothing.
   }
   else
-  { // less or equal VS2013 and Unix System glibc implement.
+  { // handle return -1 when buffer insufficient
+    /*
+    return -1 when the output was truncated:
+      - vsnprintf: vs2013/older & glibc <= 2.0.6
+      - vswprintf: all standard implemetations
+    references:
+      - https://man7.org/linux/man-pages/man3/vsnprintf.3.html
+      - https://www.cplusplus.com/reference/cstdio/vsnprintf/
+      - https://www.cplusplus.com/reference/cwchar/vswprintf/
+      - https://stackoverflow.com/questions/51134188/why-vsnwprintf-missing
+      - https://stackoverflow.com/questions/10446754/vsnwprintf-alternative-on-linux
+
+    */
+    enum : size_t
+    {
+      enlarge_limits = (1 << 20), // limits the buffer cost memory less than 2MB
+    };
     do
     {
-      buffer.resize(buffer.length() * 3 / 2);
+      buf.resize(buf.length() << 1);
 
-      va_start(args, format);
-      nret = vsnprintf(&buffer.front(), buffer.length() + 1, format, args);
+      va_copy(args, initialized_args);
+      nret = format_traits<_Elem>::format(&buf.front(), buf.length() + 1, format, args);
       va_end(args);
 
-    } while (nret < 0);
-
-    buffer.resize(nret);
+    } while (nret < 0 && buf.size() <= enlarge_limits);
+    if (nret > 0)
+      buf.resize(nret);
+    else
+      buf = format_traits<_Elem>::report_error();
   }
 
-  return buffer;
+  return buf;
 }
+
+template <class _Elem, class _Traits = std::char_traits<_Elem>,
+          class _Alloc = std::allocator<_Elem>>
+inline std::basic_string<_Elem, _Traits, _Alloc> basic_strfmt(size_t n, const _Elem* format, ...)
+{
+  va_list initialized_args;
+
+  va_start(initialized_args, format);
+  auto buf = _vstrfmt(n, format, initialized_args);
+  va_end(initialized_args);
+
+  return buf;
+}
+
+static auto constexpr strfmt = basic_strfmt<char>;
+static auto constexpr wcsfmt = basic_strfmt<wchar_t>;
 
 } // namespace yasio
 

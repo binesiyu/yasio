@@ -5,7 +5,7 @@
 /*
 The MIT License (MIT)
 
-Copyright (c) 2012-2019 halx99
+Copyright (c) 2012-2020 HALX99
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -25,17 +25,18 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
-
 #ifndef YASIO__XXSOCKET_HPP
 #define YASIO__XXSOCKET_HPP
-#pragma once
 
+#include <stddef.h>
 #include <errno.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <sstream>
 #include <vector>
 #include <chrono>
+#include <functional>
 #include "yasio/detail/config.hpp"
 
 #if defined(_MSC_VER)
@@ -44,16 +45,22 @@ SOFTWARE.
 #endif
 
 #ifdef _WIN32
-
+#  if !defined(WIN32_LEAN_AND_MEAN)
+#    define WIN32_LEAN_AND_MEAN
+#  endif
 #  include <WinSock2.h>
-
 #  include <Windows.h>
 #  if defined(_WIN32) && !defined(_WINSTORE)
 #    include <Mswsock.h>
 #    include <Mstcpip.h>
 #  endif
 #  include <Ws2tcpip.h>
-#  include <Wspiapi.h>
+#  if defined(YASIO_NT_COMPAT_GAI)
+#    include <Wspiapi.h>
+#  endif
+#  if YASIO__HAS_UDS
+#    include <afunix.h>
+#  endif
 typedef SOCKET socket_native_type;
 typedef int socklen_t;
 #  define poll WSAPoll
@@ -72,6 +79,7 @@ typedef int socklen_t;
 #  endif
 #  include <sys/select.h>
 #  include <sys/socket.h>
+#  include <sys/un.h>
 #  include <netinet/in.h>
 #  include <netinet/tcp.h>
 #  include <net/if.h>
@@ -91,14 +99,13 @@ typedef int socklen_t;
 #  if !defined(ioctlsocket)
 #    define ioctlsocket ioctl
 #  endif
+#  if defined(__linux__)
+#    define SO_NOSIGPIPE MSG_NOSIGNAL
+#  endif
 typedef int socket_native_type;
 #  undef socket
 #endif
 #include <fcntl.h> // common platform header
-
-#ifndef SO_REUSEPORT
-#  define SO_REUSEPORT SO_REUSEADDR
-#endif
 
 // redefine socket error code for posix api
 #ifdef _WIN32
@@ -186,18 +193,44 @@ typedef int socket_native_type;
 #  define EAGAIN WSATRY_AGAIN
 #endif
 
-// shoulde close connection condition when retval of recv <= 0
-#define SHOULD_CLOSE_0(n, errcode)                                                                 \
-  (((n) == 0) || ((n) < 0 && (errcode) != EAGAIN && (errcode) != EWOULDBLOCK && (errcode) != EINTR))
+#if !defined(MAXNS)
+#  define MAXNS 3
+#endif
 
-// shoulde close connection condition when retval of send <= 0
-#define SHOULD_CLOSE_1(n, errcode)                                                                 \
-  (((n) == 0) || ((n) < 0 && (errcode) != EAGAIN && (errcode) != EWOULDBLOCK &&                    \
-                  (errcode) != EINTR && (errcode) != ENOBUFS))
+#define IN_MAX_ADDRSTRLEN INET6_ADDRSTRLEN
+
+#if !defined(_WS2IPDEF_)
+inline bool IN4_IS_ADDR_LOOPBACK(const in_addr* a)
+{
+  return ((a->s_addr & 0xff) == 0x7f); // 127/8
+}
+inline bool IN4_IS_ADDR_LINKLOCAL(const in_addr* a)
+{
+  return ((a->s_addr & 0xffff) == 0xfea9); // 169.254/16
+}
+inline bool IN6_IS_ADDR_GLOBAL(const in6_addr* a)
+{
+  //
+  // Check the format prefix and exclude addresses
+  // whose high 4 bits are all zero or all one.
+  // This is a cheap way of excluding v4-compatible,
+  // v4-mapped, loopback, multicast, link-local, site-local.
+  //
+  unsigned int High = (a->s6_addr[0] & 0xf0);
+  return ((High != 0) && (High != 0xf0));
+}
+#endif
+
+// shoulde close connection condition when retval of recv < 0
+#define YASIO_SHOULD_CLOSE_0(ec) ((ec) != EAGAIN && (ec) != EWOULDBLOCK && (ec) != EINTR)
+
+// shoulde close connection condition when retval of send < 0
+#define YASIO_SHOULD_CLOSE_1(ec) ((ec) != EAGAIN && (ec) != EWOULDBLOCK && (ec) != EINTR && (ec) != ENOBUFS && (ec) != EPERM)
+
+#define YASIO_ADDR_ANY(af) (af == AF_INET ? "0.0.0.0" : "::")
 
 namespace yasio
 {
-
 namespace inet
 {
 
@@ -210,8 +243,7 @@ YASIO__NS_INLINE namespace ip
 {
 #pragma pack(push, 1)
   // ip packet
-  struct ip_header
-  {
+  struct ip_header {
     // header size; 5+
     unsigned char header_length : 4;
 
@@ -219,11 +251,9 @@ YASIO__NS_INLINE namespace ip
     unsigned char version : 4;
 
     // type of service:
-    union
-    {
+    union {
       unsigned char value;
-      struct
-      {
+      struct {
         unsigned char priority : 3;
         unsigned char D : 1;        // delay: 0(normal), 1(as little as possible)
         unsigned char T : 1;        // throughput: 0(normal), 1(as big as possible)
@@ -240,9 +270,8 @@ YASIO__NS_INLINE namespace ip
     unsigned short identifier;
 
     // flags and frag
-    // unsigned short flags:3;
-    // unsigned short frag:13;
-    unsigned short flags_and_frag;
+    unsigned short flags : 3;
+    unsigned short frag : 13;
 
     // time of living, decreased by route, if zero, this packet will by dropped
     // avoid foward looply.
@@ -260,11 +289,9 @@ YASIO__NS_INLINE namespace ip
     // check header of IP-PACKET 's correctness.
     unsigned short checksum;
 
-    typedef union
-    {
+    typedef union {
       unsigned int value;
-      struct
-      {
+      struct {
         unsigned int B1 : 8, B2 : 8, B3 : 8, B4 : 8;
       } detail;
     } dotted_decimal_t;
@@ -276,8 +303,7 @@ YASIO__NS_INLINE namespace ip
     dotted_decimal_t dst_ip;
   };
 
-  struct psd_header
-  {
+  struct psd_header {
     unsigned long src_addr;
     unsigned long dst_addr;
     char mbz;
@@ -285,48 +311,41 @@ YASIO__NS_INLINE namespace ip
     unsigned short tcp_length;
   };
 
-  struct tcp_header
-  {
-    unsigned short src_port;
+  struct tcp_header {
+    unsigned short src_port; // lgtm [cpp/class-many-fields]
     unsigned short dst_port;
     unsigned int seqno;
     unsigned int ackno;
     unsigned char header_length : 4;
     unsigned char reserved : 4;
-    unsigned char flg_fin : 1, flg_syn : 1, flg_rst : 1, flg_psh : 1, flg_ack : 1, flg_urg : 1,
-        flg_reserved : 2;
+    unsigned char flg_fin : 1, flg_syn : 1, flg_rst : 1, flg_psh : 1, flg_ack : 1, flg_urg : 1, flg_reserved : 2;
     unsigned short win_length;
     unsigned short checksum;
-    unsigned short urp; // emergency
+    unsigned short urp;
   };
 
-  struct udp_header
-  {
+  struct udp_header {
     unsigned short src_port;
     unsigned short dst_port;
     unsigned short length;
     unsigned short checksum;
   };
 
-  struct icmp_header
-  {
+  struct icmp_header {
     unsigned char type;      // 8bit type
     unsigned char code;      // 8bit code
     unsigned short checksum; // 16bit check sum
     unsigned short id;       // identifier: usually use process id
     unsigned short seqno;    // message sequence NO.
-    unsigned int timestamp;  // timestamp
   };
 
-  struct eth_header
-  {
+  struct eth_header {
     unsigned dst_eth[6];
     unsigned src_eth[6];
     unsigned eth_type;
   };
 
-  struct arp_header
-  {
+  struct arp_header {
     unsigned short arp_hw;    // format of hardware address
     unsigned short arp_pro;   // format of protocol address
     unsigned char arp_hlen;   // length of hardware address
@@ -338,8 +357,7 @@ YASIO__NS_INLINE namespace ip
     unsigned long arp_tpa;    // target protocol address;
   };
 
-  struct arp_packet
-  {
+  struct arp_packet {
     eth_header ethhdr;
     arp_header arphdr;
   };
@@ -347,41 +365,73 @@ YASIO__NS_INLINE namespace ip
 
   namespace compat
   {
-  YASIO__DECL const char* inet_ntop(int af, const void* src, char* dst, socklen_t size);
+  YASIO__DECL const char* inet_ntop(int af, const void* src, char* dst, socklen_t);
   YASIO__DECL int inet_pton(int af, const char* src, void* dst);
   } // namespace compat
 
-  union endpoint
-  {
+  inline bool is_global_in4_addr(const in_addr* addr) { return !IN4_IS_ADDR_LOOPBACK(addr) && !IN4_IS_ADDR_LINKLOCAL(addr); };
+  inline bool is_global_in6_addr(const in6_addr* addr) { return !!IN6_IS_ADDR_GLOBAL(addr); };
+
+  struct endpoint {
   public:
     endpoint(void) { this->zeroset(); }
-    explicit endpoint(const addrinfo* info) { assign(info); }
-    explicit endpoint(const sockaddr* info) { assign(info); }
-    endpoint(const char* addr, unsigned short port) { assign(addr, port); }
+    endpoint(const endpoint& rhs) { this->as_is(rhs); }
+    explicit endpoint(const addrinfo* info) { as_is(info); }
+    explicit endpoint(const sockaddr* info) { as_is(info); }
+    explicit endpoint(const char* addr, unsigned short port = 0) { as_in(addr, port); }
+    explicit endpoint(uint32_t addr, unsigned short port = 0) { as_in(addr, port); }
+    endpoint(int family, const void* addr, unsigned short port = 0) { as_in(family, addr, port); }
 
-    void assign(const addrinfo* info) { this->assign(info->ai_addr, info->ai_addrlen); }
+    explicit operator bool() const { return this->af() != AF_UNSPEC; }
 
-    void assign(const void* ai_addr, size_t ai_addrlen)
+    endpoint& operator=(const endpoint& rhs) { return this->as_is(rhs); }
+    endpoint& as_is(const endpoint& rhs)
     {
       this->zeroset();
-      ::memcpy(this, ai_addr, ai_addrlen);
+      memcpy(this, &rhs, sizeof(rhs));
+      return *this;
     }
-
-    void assign(const sockaddr* addr)
+    endpoint& as_is(const addrinfo* info) { return this->as_is_raw(info->ai_addr, info->ai_addrlen); }
+    endpoint& as_is(const sockaddr* addr)
     {
       this->zeroset();
       switch (addr->sa_family)
       {
         case AF_INET:
           ::memcpy(&in4_, addr, sizeof(sockaddr_in));
+          this->len(sizeof(sockaddr_in));
           break;
         case AF_INET6:
           ::memcpy(&in6_, addr, sizeof(sockaddr_in6));
+          this->len(sizeof(sockaddr_in6));
+          break;
+#if defined(YASIO_ENABLE_UDS) && YASIO__HAS_UDS
+        case AF_UNIX:
+          as_un(((sockaddr_un*)addr)->sun_path);
+          break;
+#endif
+      }
+      return *this;
+    }
+    endpoint& as_in(int family, const void* addr_in, u_short port)
+    {
+      this->zeroset();
+      this->af(family);
+      this->port(port);
+      switch (family)
+      {
+        case AF_INET:
+          ::memcpy(&in4_.sin_addr, addr_in, sizeof(in_addr));
+          this->len(sizeof(sockaddr_in));
+          break;
+        case AF_INET6:
+          ::memcpy(&in6_.sin6_addr, addr_in, sizeof(in6_addr));
+          this->len(sizeof(sockaddr_in6));
           break;
       }
+      return *this;
     }
-
-    bool assign(const char* addr, unsigned short port)
+    endpoint& as_in(const char* addr, unsigned short port)
     {
       this->zeroset();
 
@@ -394,7 +444,7 @@ YASIO__NS_INLINE namespace ip
         {
           this->in4_.sin_family = AF_INET;
           this->in4_.sin_port   = htons(port);
-          return true;
+          this->len(sizeof(sockaddr_in));
         }
       }
       else
@@ -403,14 +453,53 @@ YASIO__NS_INLINE namespace ip
         {
           this->in6_.sin6_family = AF_INET6;
           this->in6_.sin6_port   = htons(port);
-          return true;
+          this->len(sizeof(sockaddr_in6));
         }
       }
 
-      return false;
+      return *this;
+    }
+    endpoint& as_in(uint32_t addr, u_short port)
+    {
+      this->zeroset();
+
+      this->af(AF_INET);
+      this->addr_v4(addr);
+      this->port(port);
+      this->len(sizeof(sockaddr_in));
+      return *this;
+    }
+
+#if defined(YASIO_ENABLE_UDS) && YASIO__HAS_UDS
+    endpoint& as_un(const char* name)
+    {
+      int n = snprintf(un_.sun_path, sizeof(un_.sun_path) - 1, "%s", name);
+      if (n > 0)
+      {
+        un_.sun_family = AF_UNIX;
+        this->len(offsetof(struct sockaddr_un, sun_path) + n + 1);
+      }
+      else
+      {
+        un_.sun_family = AF_UNSPEC;
+        this->len(0);
+      }
+      return *this;
+    }
+#endif
+
+    endpoint& as_is_raw(const void* ai_addr, size_t ai_addrlen)
+    {
+      this->zeroset();
+      ::memcpy(this, ai_addr, ai_addrlen);
+      this->len(ai_addrlen);
+      return *this;
     }
 
     void zeroset() { ::memset(this, 0x0, sizeof(*this)); }
+
+    void af(int v) { sa_.sa_family = v; }
+    int af() const { return sa_.sa_family; }
 
     void ip(const char* addr)
     {
@@ -428,60 +517,153 @@ YASIO__NS_INLINE namespace ip
         compat::inet_pton(AF_INET6, addr, &this->in6_.sin6_addr);
       }
     }
-
-    int af() const { return sa_.sa_family; }
-    std::string to_string(void) const
+    std::string ip() const
     {
-      std::string addr(64, '[');
+      std::string ipstring(IN_MAX_ADDRSTRLEN - 1, '\0');
+
+      auto str = inaddr_to_string(
+          &ipstring.front(), [](const in_addr*) { return true; }, [](const in6_addr*) { return true; });
+
+      ipstring.resize(str ? strlen(str) : 0);
+      return ipstring;
+    }
+    // to_string with port, can simply add prefix "http::" or "https://" for url
+    std::string to_string() const
+    {
+      std::string addr(IN_MAX_ADDRSTRLEN + sizeof("65535") + 2, '[');
 
       size_t n = 0;
 
       switch (sa_.sa_family)
       {
         case AF_INET:
-          n = strlen(compat::inet_ntop(AF_INET, &in4_.sin_addr, &addr.front(),
-                                       static_cast<socklen_t>(addr.length())));
+          n = strlen(compat::inet_ntop(AF_INET, &in4_.sin_addr, &addr.front(), static_cast<socklen_t>(addr.length())));
           n += sprintf(&addr.front() + n, ":%u", this->port());
           break;
         case AF_INET6:
-          n = strlen(compat::inet_ntop(AF_INET6, &in6_.sin6_addr, &addr.front() + 1,
-                                       static_cast<socklen_t>(addr.length() - 1)));
+          n = strlen(compat::inet_ntop(AF_INET6, &in6_.sin6_addr, &addr.front() + 1, static_cast<socklen_t>(addr.length() - 1)));
           n += sprintf(&addr.front() + n, "]:%u", this->port());
           break;
+#if defined(YASIO_ENABLE_UDS) && YASIO__HAS_UDS
+        case AF_UNIX:
+          n = this->len();
+          addr.assign(un_.sun_path, n);
+          break;
+#endif
       }
 
       addr.resize(n);
 
       return addr;
     }
-    std::string ip() const
-    {
-      std::string ipstring(64, '\0');
 
-      size_t n = 0;
-
-      switch (sa_.sa_family)
-      {
-        case AF_INET:
-          n = strlen(compat::inet_ntop(AF_INET, &in4_.sin_addr, &ipstring.front(), 64));
-          break;
-        case AF_INET6:
-          n = strlen(compat::inet_ntop(AF_INET6, &in6_.sin6_addr, &ipstring.front(), 64));
-          break;
-      }
-      ipstring.resize(n);
-
-      return ipstring;
-    }
     unsigned short port(void) const { return ntohs(in4_.sin_port); }
     void port(unsigned short value) { in4_.sin_port = htons(value); }
 
-    bool operator<(const endpoint& rhs) { return ::memcmp(this, &rhs, sizeof(rhs)) < 0; }
-    bool operator==(const endpoint& rhs) { return ::memcmp(this, &rhs, sizeof(rhs)) == 0; }
+    void addr_v4(uint32_t addr) { in4_.sin_addr.s_addr = htonl(addr); }
+    uint32_t addr_v4() const { return ntohl(in4_.sin_addr.s_addr); }
 
-    sockaddr sa_;
-    sockaddr_in in4_;
-    sockaddr_in6 in6_;
+    /*
+     %N: s_net   127
+     %H: s_host  0
+     %L: s_lh    0
+     %M: s_impno 1
+     %l: low byte of port
+     %h: high byte of port
+    */
+    std::string format_v4(const char* foramt)
+    {
+      static const char* const _SIN_FORMATS[] = {"%N", "%H", "%L", "%M", "%l", "%h"};
+
+      unsigned char addr_bytes[sizeof(in4_.sin_addr.s_addr) + sizeof(u_short)];
+      memcpy(addr_bytes, &in4_.sin_addr.s_addr, sizeof(in4_.sin_addr.s_addr));
+      memcpy(addr_bytes + sizeof(in4_.sin_addr.s_addr), &in4_.sin_port, sizeof(in4_.sin_port));
+
+      char snum[sizeof("255")] = {0};
+      const size_t _N0         = sizeof("%N") - 1;
+      std::string s            = foramt;
+      for (size_t idx = 0; idx < YASIO_ARRAYSIZE(_SIN_FORMATS); ++idx)
+      {
+        auto fmt   = _SIN_FORMATS[idx];
+        auto offst = s.find(fmt);
+        if (offst != std::string::npos)
+        {
+          sprintf(snum, "%u", addr_bytes[idx]);
+          s.replace(offst, _N0, snum);
+        }
+      }
+
+      return s;
+    }
+
+    YASIO_OBSOLETE_DEPRECATE(endpoint::format_v4)
+    std::string to_strf_v4(const char* format) { return format_v4(format); }
+
+    // in_addr(ip) to string with pred
+    template <typename _Pred4, typename _Pred6> const char* inaddr_to_string(char* str /*[IN_MAX_ADDRSTRLEN]*/, _Pred4&& pred4, _Pred6&& pred6) const
+    {
+      switch (af())
+      {
+        case AF_INET:
+          if (pred4(&in4_.sin_addr))
+            return compat::inet_ntop(AF_INET, &in4_.sin_addr, str, INET_ADDRSTRLEN);
+          break;
+        case AF_INET6:
+          if (pred6(&in6_.sin6_addr))
+            return compat::inet_ntop(AF_INET6, &in6_.sin6_addr, str, INET6_ADDRSTRLEN);
+          break;
+      }
+      return nullptr;
+    }
+
+    // in_addr(ip) to csv without loopback or linklocal address
+    void inaddr_to_csv_nl(std::string& csv)
+    {
+      char str[INET6_ADDRSTRLEN] = {0};
+      if (inaddr_to_string(str, is_global_in4_addr, is_global_in6_addr))
+      {
+        csv += str;
+        csv += ',';
+      }
+    }
+
+    // the in_addr(from sockaddr) to csv string helper function without loopback or linklocal
+    // address
+    static void inaddr_to_csv_nl(const sockaddr* addr, std::string& csv) { endpoint(addr).inaddr_to_csv_nl(csv); }
+
+    // the in_addr/in6_addr to csv string helper function without loopback or linklocal address
+    // the inaddr should be union of in_addr,in6_addr or ensure it's memory enough when
+    // family=AF_INET6
+    static void inaddr_to_csv_nl(int family, const void* inaddr, std::string& csv) { endpoint(family, inaddr).inaddr_to_csv_nl(csv); }
+
+    void len(size_t n)
+    {
+#if !YASIO__HAS_SA_LEN
+      len_ = static_cast<uint8_t>(n);
+#else
+      sa_.sa_len = static_cast<uint8_t>(n);
+#endif
+    }
+    socklen_t len() const
+    {
+#if !YASIO__HAS_SA_LEN
+      return len_;
+#else
+      return sa_.sa_len;
+#endif
+    }
+
+    union {
+      sockaddr sa_;
+      sockaddr_in in4_;
+      sockaddr_in6 in6_;
+#if defined(YASIO_ENABLE_UDS) && YASIO__HAS_UDS
+      sockaddr_un un_;
+#endif
+    };
+#if !YASIO__HAS_SA_LEN
+    uint8_t len_;
+#endif
   };
 
   // supported internet protocol flags
@@ -494,48 +676,28 @@ YASIO__NS_INLINE namespace ip
   };
 } // namespace ip
 
-#if !YASIO__HAVE_NS_INLINE
+#if !YASIO__HAS_NS_INLINE
 using namespace yasio::inet::ip;
 #endif
 
 /*
 ** CLASS xxsocket: a posix socket wrapper
 */
-class xxsocket
-{
-public:
-  /*
-  summary: Gets supported internet protocol versions of localhost
-  return:
-    ipsv_unavailable: The network unavailable.
-    ipsv_ipv4: Support ipv4 only.
-    ipsv_ipv6: Support ipv6 only.
-    ipsv_dual_stack:
-      Support ipv4 or ipv6, but for multi network adapters device, you should always
-      use ipv4 preferred, such as smart phone with wifi & cellular network. The smart phone's os
-      will choose wifi when it is available to avoid consume user's cash, when the cellular support
-      ipv6/ipv4 but the wifi only support ipv4, then use ipv6 will cause network issue.
-      For more detail, see: https://github.com/halx99/yasio/issues/130
-  */
-  YASIO__DECL static int getipsv(void);
-
+class xxsocket {
 public: /// portable connect APIs
   // easy to connect a server ipv4 or ipv6 with local ip protocol version detect
   // for support ipv6 ONLY network.
   YASIO__DECL int xpconnect(const char* hostname, u_short port, u_short local_port = 0);
-  YASIO__DECL int xpconnect_n(const char* hostname, u_short port,
-                              const std::chrono::microseconds& wtimeout, u_short local_port = 0);
+  YASIO__DECL int xpconnect_n(const char* hostname, u_short port, const std::chrono::microseconds& wtimeout, u_short local_port = 0);
 
   // easy to connect a server ipv4 or ipv6.
   YASIO__DECL int pconnect(const char* hostname, u_short port, u_short local_port = 0);
-  YASIO__DECL int pconnect_n(const char* hostname, u_short port,
-                             const std::chrono::microseconds& wtimeout, u_short local_port = 0);
+  YASIO__DECL int pconnect_n(const char* hostname, u_short port, const std::chrono::microseconds& wtimeout, u_short local_port = 0);
   YASIO__DECL int pconnect_n(const char* hostname, u_short port, u_short local_port = 0);
 
   // easy to connect a server ipv4 or ipv6.
   YASIO__DECL int pconnect(const endpoint& ep, u_short local_port = 0);
-  YASIO__DECL int pconnect_n(const endpoint& ep, const std::chrono::microseconds& wtimeout,
-                             u_short local_port = 0);
+  YASIO__DECL int pconnect_n(const endpoint& ep, const std::chrono::microseconds& wtimeout, u_short local_port = 0);
   YASIO__DECL int pconnect_n(const endpoint& ep, u_short local_port = 0);
 
   // easy to create a tcp ipv4 or ipv6 server socket.
@@ -547,12 +709,15 @@ public:
 
   // Construct with a exist socket handle
   YASIO__DECL xxsocket(socket_native_type handle);
+  // Disable copy constructor
   YASIO__DECL xxsocket(const xxsocket&) = delete;
-  YASIO__DECL xxsocket(xxsocket&&); // Construct with a exist socket, it will replace the source
+  // Construct with a exist socket, it will replace the source
+  YASIO__DECL xxsocket(xxsocket&&);
 
   YASIO__DECL xxsocket& operator=(socket_native_type handle);
-  YASIO__DECL xxsocket&
-  operator=(const xxsocket&) = delete; // Construct with a exist socket, it will replace the source
+  // Disable copy assign operator
+  YASIO__DECL xxsocket& operator=(const xxsocket&) = delete;
+  // Construct with a exist socket, it will replace the source
   YASIO__DECL xxsocket& operator=(xxsocket&&);
 
   // See also as function: open
@@ -575,20 +740,14 @@ public:
 #ifdef _WIN32
   YASIO__DECL bool open_ex(int af = AF_INET, int type = SOCK_STREAM, int protocol = 0);
 
-  YASIO__DECL static bool accept_ex(SOCKET sockfd_listened, SOCKET sockfd_prepared,
-                                    PVOID lpOutputBuffer, DWORD dwReceiveDataLength,
-                                    DWORD dwLocalAddressLength, DWORD dwRemoteAddressLength,
-                                    LPDWORD lpdwBytesReceived, LPOVERLAPPED lpOverlapped);
+  YASIO__DECL static bool accept_ex(SOCKET sockfd_listened, SOCKET sockfd_prepared, PVOID lpOutputBuffer, DWORD dwReceiveDataLength, DWORD dwLocalAddressLength,
+                                    DWORD dwRemoteAddressLength, LPDWORD lpdwBytesReceived, LPOVERLAPPED lpOverlapped);
 
-  YASIO__DECL static bool connect_ex(SOCKET s, const struct sockaddr* name, int namelen,
-                                     PVOID lpSendBuffer, DWORD dwSendDataLength,
-                                     LPDWORD lpdwBytesSent, LPOVERLAPPED lpOverlapped);
+  YASIO__DECL static bool connect_ex(SOCKET s, const struct sockaddr* name, int namelen, PVOID lpSendBuffer, DWORD dwSendDataLength, LPDWORD lpdwBytesSent,
+                                     LPOVERLAPPED lpOverlapped);
 
-  YASIO__DECL static void translate_sockaddrs(PVOID lpOutputBuffer, DWORD dwReceiveDataLength,
-                                              DWORD dwLocalAddressLength,
-                                              DWORD dwRemoteAddressLength, sockaddr** LocalSockaddr,
-                                              LPINT LocalSockaddrLength, sockaddr** RemoteSockaddr,
-                                              LPINT RemoteSockaddrLength);
+  YASIO__DECL static void translate_sockaddrs(PVOID lpOutputBuffer, DWORD dwReceiveDataLength, DWORD dwLocalAddressLength, DWORD dwRemoteAddressLength,
+                                              sockaddr** LocalSockaddr, LPINT LocalSockaddrLength, sockaddr** RemoteSockaddr, LPINT RemoteSockaddrLength);
 #endif
 
   /** Is this socket opened **/
@@ -597,7 +756,6 @@ public:
   /** Gets the socket fd value **/
   YASIO__DECL socket_native_type native_handle(void) const;
 
-  // Detach fd only;
   YASIO__DECL socket_native_type detach(void);
 
   /* @brief: Set this socket io mode to nonblocking
@@ -608,20 +766,14 @@ public:
   YASIO__DECL int set_nonblocking(bool nonblocking) const;
   YASIO__DECL static int set_nonblocking(socket_native_type s, bool nonblocking);
 
-  /* @brief: Set this socket io mode to blocking
+  /* @brief: Test whether the socket has nonblocking flag
   ** @params:
   **
-  ** @returns: [0] succeed, otherwise, a value of SOCKET_ERROR is returned.
+  ** @returns: [1] yes. [0] no
+  ** @pitfall: for wsock2, will return [-1] when it's a unconnected SOCK_STREAM
   */
-  // int set_blocking(void) const;
-
-  /* @brief: Set this socket io mode
-  ** @params:
-  **        mode: [nonblocking] or [blocking]
-  **
-  ** @returns: [0] succeed, otherwise, a value of SOCKET_ERROR is returned.
-  */
-  // int set_mode(u_long mode = nonblocking) const;
+  YASIO__DECL int test_nonblocking() const;
+  YASIO__DECL static int test_nonblocking(socket_native_type s);
 
   /* @brief: Associates a local address with this socket
   ** @params:
@@ -633,6 +785,7 @@ public:
   */
   YASIO__DECL int bind(const char* addr, unsigned short port) const;
   YASIO__DECL int bind(const endpoint&) const;
+  YASIO__DECL int bind_any(bool ipv6 = false) const;
 
   /* @brief: Places this socket in a state in which it is listening for an incoming connection
   ** @params:
@@ -650,20 +803,17 @@ public:
   ** @returns:
   **        If no error occurs, accept returns a new socket on which
   **        the actual connection is made.
-  **        Otherwise, a value of [nullptr] is returned
+  **        Otherwise, a value of [invalid_socket] is returned
   */
   YASIO__DECL xxsocket accept(socklen_t addrlen = sizeof(sockaddr));
 
   /* @brief: Permits an incoming connection attempt on this socket
   ** @params:
-  **        timeout : milliseconds of waiting for new connection
-  **
   ** @returns:
-  **        If no error occurs, accept returns a new socket on which
-  **        the actual connection is made.
-  **        Otherwise, a value of [nullptr] is returned
+  **        If no error occurs, return 0, and the new_sock will be the actual connection is made.
+  **        Otherwise, a EWOULDBLOCK,EAGAIN or other value is returned
   */
-  YASIO__DECL xxsocket accept_n(timeval* timeout);
+  YASIO__DECL int accept_n(socket_native_type& new_sock);
 
   /* @brief: Establishes a connection to a specified this socket
   ** @params:
@@ -687,14 +837,9 @@ public:
   ** @remark: Because on win32, there is no way to test whether the socket is non-blocking,
   ** so, after this function called, the socket will be always set to blocking mode.
   */
-  YASIO__DECL int connect_n(const char* addr, u_short port,
-                            const std::chrono::microseconds& wtimeout);
+  YASIO__DECL int connect_n(const char* addr, u_short port, const std::chrono::microseconds& wtimeout);
   YASIO__DECL int connect_n(const endpoint& ep, const std::chrono::microseconds& wtimeout);
-  YASIO__DECL int connect_n(const char* addr, u_short port, timeval* timeout);
-  YASIO__DECL int connect_n(const endpoint& ep, timeval* timeout);
-  YASIO__DECL static int connect_n(socket_native_type s, const char* addr, u_short port,
-                                   timeval* timeout);
-  YASIO__DECL static int connect_n(socket_native_type s, const endpoint& ep, timeval* timeout);
+  YASIO__DECL static int connect_n(socket_native_type s, const endpoint& ep, const std::chrono::microseconds& wtimeout);
 
   /* @brief: Establishes a connection to a specified this socket with nonblocking
   ** @params:
@@ -703,7 +848,34 @@ public:
   ** @remark: this function will return immediately, for tcp, you should detect whether the
   ** handshake complete by handle_write_ready.
   */
+  YASIO__DECL int connect_n(const endpoint& ep);
   YASIO__DECL static int connect_n(socket_native_type s, const endpoint& ep);
+
+  /* @brief: Disconnect a connectionless socket (such as SOCK_DGRAM)
+  **
+  */
+  YASIO__DECL int disconnect();
+  YASIO__DECL static int disconnect(socket_native_type s);
+
+  /* @brief: nonblock send
+   ** @params: omit
+   **
+   ** @returns:
+   **         If no error occurs, send returns the total number of bytes sent,
+   **         Oterwise, If retval <=0, mean error occured, and should close socket.
+   */
+  YASIO__DECL int send_n(const void* buf, int len, const std::chrono::microseconds& wtimeout, int flags = 0);
+  YASIO__DECL static int send_n(socket_native_type s, const void* buf, int len, std::chrono::microseconds wtimeout, int flags = 0);
+
+  /* @brief: nonblock recv
+  ** @params:
+  **       The timeout is in microseconds
+  ** @returns:
+  **         If no error occurs, send returns the total number of bytes recvived,
+  **         Oterwise, If retval <=0, mean error occured, and should close socket.
+  */
+  YASIO__DECL int recv_n(void* buf, int len, const std::chrono::microseconds& wtimeout, int flags = 0) const;
+  YASIO__DECL static int recv_n(socket_native_type s, void* buf, int len, std::chrono::microseconds wtimeout, int flags = 0);
 
   /* @brief: Sends data on this connected socket
   ** @params: omit
@@ -714,19 +886,7 @@ public:
   **         Otherwise, a value of SOCKET_ERROR is returned.
   */
   YASIO__DECL int send(const void* buf, int len, int flags = 0) const;
-
-  /* @brief: nonblock send
-   ** @params: omit
-   **
-   ** @returns:
-   **         If no error occurs, send returns the total number of bytes sent,
-   **         Oterwise, If retval <=0, mean error occured, and should close socket.
-   */
-  YASIO__DECL int send_n(const void* buf, int len, timeval* timeout, int flags = 0);
-  YASIO__DECL int send_n(const void* buf, int len, const std::chrono::microseconds& wtimeout,
-                         int flags = 0);
-  YASIO__DECL static int send_n(socket_native_type s, const void* buf, int len, timeval* timeout,
-                                int flags = 0);
+  YASIO__DECL static int send(socket_native_type fd, const void* buf, int len, int flags = 0);
 
   /* @brief: Receives data from this connected socket or a bound connectionless socket.
   ** @params: omit
@@ -737,23 +897,7 @@ public:
   **         If the connection has been gracefully closed, the return value is [0].
   */
   YASIO__DECL int recv(void* buf, int len, int flags = 0) const;
-
-  YASIO__DECL bool read_until(std::string& buffer, const char delim);
-  YASIO__DECL bool read_until(std::string& buffer, const std::string& delims);
-  YASIO__DECL bool read_until(std::string& buffer, const char* delims, size_t len);
-
-  /* @brief: nonblock recv
-  ** @params: omit
-  **
-  ** @returns:
-  **         If no error occurs, send returns the total number of bytes recvived,
-  **         Oterwise, If retval <=0, mean error occured, and should close socket.
-  */
-  YASIO__DECL int recv_n(void* buf, int len, const std::chrono::microseconds& wtimeout,
-                         int flags = 0) const;
-  YASIO__DECL int recv_n(void* buf, int len, timeval* timeout, int flags = 0) const;
-  YASIO__DECL static int recv_n(socket_native_type s, void* buf, int len, timeval* timeout,
-                                int flags = 0);
+  YASIO__DECL static int recv(socket_native_type s, void* buf, int len, int flags);
 
   /* @brief: Sends data on this connected socket
   ** @params: omit
@@ -763,29 +907,7 @@ public:
   **         which can be less than the number requested to be sent in the len parameter.
   **         Otherwise, a value of SOCKET_ERROR is returned.
   */
-  YASIO__DECL int send_i(const void* buf, int len, int flags = 0) const;
-  YASIO__DECL static int send_i(socket_native_type fd, const void* buf, int len, int flags = 0);
-
-  /* @brief: Receives data from this connected socket or a bound connectionless socket.
-  ** @params: omit
-  **
-  ** @returns:
-  **         If no error occurs, recv returns the number of bytes received and
-  **         the buffer pointed to by the buf parameter will contain this data received.
-  **         If the connection has been gracefully closed, the return value is [0].
-  */
-  YASIO__DECL int recv_i(void* buf, int len, int flags = 0) const;
-  YASIO__DECL static int recv_i(socket_native_type s, void* buf, int len, int flags);
-
-  /* @brief: Sends data on this connected socket
-  ** @params: omit
-  **
-  ** @returns:
-  **         If no error occurs, send returns the total number of bytes sent,
-  **         which can be less than the number requested to be sent in the len parameter.
-  **         Otherwise, a value of SOCKET_ERROR is returned.
-  */
-  YASIO__DECL int sendto_i(const void* buf, int len, const endpoint& to, int flags = 0) const;
+  YASIO__DECL int sendto(const void* buf, int len, const endpoint& to, int flags = 0) const;
 
   /* @brief: Receives a datagram and stores the source address
   ** @params: omit
@@ -795,18 +917,13 @@ public:
   **         the buffer pointed to by the buf parameter will contain this data received.
   **         If the connection has been gracefully closed, the return value is [0].
   */
-  YASIO__DECL int recvfrom_i(void* buf, int len, endpoint& peer, int flags = 0) const;
+  YASIO__DECL int recvfrom(void* buf, int len, endpoint& peer, int flags = 0) const;
 
-  YASIO__DECL int handle_write_ready(timeval* timeo) const;
-  YASIO__DECL static int handle_write_ready(socket_native_type s, timeval* timeo);
-  YASIO__DECL static int handle_connect_ready(socket_native_type s, timeval* timeo);
+  YASIO__DECL int handle_write_ready(const std::chrono::microseconds& wtimeout) const;
+  YASIO__DECL static int handle_write_ready(socket_native_type s, const std::chrono::microseconds& wtimeout);
 
   YASIO__DECL int handle_read_ready(const std::chrono::microseconds& wtimeout) const;
-  YASIO__DECL int handle_read_ready(timeval* timeo) const;
-
-  YASIO__DECL static int handle_read_ready(socket_native_type s,
-                                           const std::chrono::microseconds& wtimeout);
-  YASIO__DECL static int handle_read_ready(socket_native_type s, timeval* timeo);
+  YASIO__DECL static int handle_read_ready(socket_native_type s, const std::chrono::microseconds& wtimeout);
 
   /* @brief: Get local address info
   ** @params : None
@@ -835,8 +952,11 @@ public:
   **          [<0].one or more errors occured
   */
   YASIO__DECL int set_keepalive(int flag = 1, int idle = 7200, int interval = 75, int probes = 10);
-  YASIO__DECL static int set_keepalive(socket_native_type s, int flag, int idle, int interval,
-                                       int probes);
+  YASIO__DECL static int set_keepalive(socket_native_type s, int flag, int idle, int interval, int probes);
+
+  YASIO__DECL void reuse_address(bool reuse);
+
+  YASIO__DECL void exclusive_address(bool exclusive);
 
   /* @brief: Sets the socket option
   ** @params :
@@ -848,54 +968,85 @@ public:
   ** @examples:
   **       set_optval(SOL_SOCKET, SO_SNDBUF, 4096);
   **       set_optval(SOL_SOCKET, SO_RCVBUF, 4096);
-  **       set_optval(SOL_SOCKET, SO_SNDTIMEO, 10);
-  **       set_optval(SOL_SOCKET, SO_RCVTIMEO, 10);
   **
-  ** @returns: If no error occurs, getsockopt returns zero. Otherwise, a value of SOCKET_ERROR is
-  *returned
+  ** @remark: for more detail, please see:
+  **       windows: https://docs.microsoft.com/en-us/windows/win32/api/winsock/nf-winsock-setsockopt
+  **       linux: https://linux.die.net/man/3/setsockopt
+  **
+  ** @returns: If no error occurs, set_optval returns zero. Otherwise, a value of SOCKET_ERROR is
+  **       returned
   */
-  template <typename T> inline int set_optval(int level, int optname, const T& optval);
+  template <typename _Ty> inline int set_optval(int level, int optname, const _Ty& optval) { return set_optval(this->fd, level, optname, optval); }
+  template <typename _Ty> inline static int set_optval(socket_native_type sockfd, int level, int optname, const _Ty& optval)
+  {
+    return set_optval(sockfd, level, optname, &optval, static_cast<socklen_t>(sizeof(_Ty)));
+  }
 
-  template <typename T>
-  inline static int set_optval(socket_native_type, int level, int optname, const T& optval);
+  int set_optval(int level, int optname, const void* optval, socklen_t optlen) { return set_optval(this->fd, level, optname, optval, optlen); }
+  static int set_optval(socket_native_type sockfd, int level, int optname, const void* optval, socklen_t optlen)
+  {
+    return ::setsockopt(sockfd, level, optname, static_cast<const char*>(optval), optlen);
+  }
 
   /* @brief: Retrieves a socket option
   ** @params :
   **     level: The level at which the option is defined. Example: SOL_SOCKET.
   **   optname: The socket option for which the value is to be retrieved.
   **            Example: SO_ACCEPTCONN. The optname value must be a socket option defined within the
-  *specified level, or behavior is undefined.
+  **            specified level, or behavior is undefined.
   **    optval: A variable to the buffer in which the value for the requested option is to be
-  *returned.
+  **            returned.
   **
-  ** @returns: If no error occurs, getsockopt returns zero. Otherwise, a value of SOCKET_ERROR is
+  ** @returns: If no error occurs, get_optval returns zero. Otherwise, a value of SOCKET_ERROR is
   *returned
   */
-  template <typename T>
-  inline int get_optval(int level, int optname, T& optval, socklen_t = sizeof(T)) const;
-
-  template <typename T>
-  inline static int get_optval(socket_native_type s, int level, int optname, T& optval,
-                               socklen_t = sizeof(T));
+  template <typename _Ty> inline _Ty get_optval(int level, int optname) const
+  {
+    _Ty optval = {};
+    get_optval(this->fd, level, optname, optval);
+    return optval;
+  }
+  template <typename _Ty> inline int get_optval(int level, int optname, _Ty& optval) const { return get_optval(this->fd, level, optname, optval); }
+  template <typename _Ty> inline static int get_optval(socket_native_type sockfd, int level, int optname, _Ty& optval)
+  {
+    socklen_t optlen = static_cast<socklen_t>(sizeof(_Ty));
+    return get_optval(sockfd, level, optname, &optval, &optlen);
+  }
+  static int get_optval(socket_native_type sockfd, int level, int optname, void* optval, socklen_t* optlen)
+  {
+    return ::getsockopt(sockfd, level, optname, static_cast<char*>(optval), optlen);
+  }
 
   /* @brief: control the socket
   ** @params :
   **          see MSDN or man page
-  ** @returns: If no error occurs, getsockopt returns zero. Otherwise, a value of SOCKET_ERROR is
-  *returned
+  ** @returns: If no error occurs, ioctl returns zero. Otherwise, a value of SOCKET_ERROR is
+  **           returned
   **
   **
   **
   */
-  template <typename _T> inline int ioctl(long cmd, const _T& argp) const;
+  template <typename _Ty> inline int ioctl(long cmd, const _Ty& value) const { return xxsocket::ioctl(this->fd, cmd, value); }
+  template <typename _Ty> inline static int ioctl(socket_native_type s, long cmd, const _Ty& value)
+  {
+    u_long argp = static_cast<u_long>(value);
+    return ::ioctlsocket(s, cmd, &argp);
+  }
 
-  template <typename _T> inline static int ioctl(socket_native_type s, long cmd, const _T& argp);
+  /* @brief: wrapper system select, hide signal EINTR
+  ** @params:
+  **          s: the socket fd, it's different with system
+  **          see MSDN or man page
+  ** @returns: If no error occurs, returns >= 0. Otherwise, a value of -1 is
+  **          returned
+  */
+  YASIO__DECL static int select(socket_native_type s, fd_set* readfds, fd_set* writefds, fd_set* exceptfds, std::chrono::microseconds wtimeout);
 
   /* @brief: check is a client socket alive
   ** @params :
   **          see MSDN or man page
-  ** @returns: If no error occurs, getsockopt returns zero. Otherwise, a value of SOCKET_ERROR is
-  *returned
+  ** @returns: If no error occurs, alive returns true. Otherwise, a value of false is
+  **          returned
   */
   YASIO__DECL bool alive(void) const;
 
@@ -915,6 +1066,15 @@ public:
    */
   YASIO__DECL void close(void);
 
+  /* @brief: Retrive tcp socket rtt in microseconds
+   ** @params:
+   **        non
+   **
+   ** @returns: [0] succeed, otherwise, a value of SOCKET_ERROR is returned.
+   */
+  YASIO__DECL uint32_t tcp_rtt() const;
+  YASIO__DECL static uint32_t tcp_rtt(socket_native_type s);
+
   YASIO__DECL operator socket_native_type(void) const;
 
   /// <summary>
@@ -931,44 +1091,39 @@ public:
   /// <summary>
   /// Resolve all as ipv4 or ipv6 endpoints
   /// </summary>
-  YASIO__DECL static int resolve(std::vector<endpoint>& endpoints, const char* hostname,
-                                 unsigned short port = 0);
+  YASIO__DECL static int resolve(std::vector<endpoint>& endpoints, const char* hostname, unsigned short port = 0, int socktype = SOCK_STREAM);
 
   /// <summary>
   /// Resolve as ipv4 address only.
   /// </summary>
-  YASIO__DECL static int resolve_v4(std::vector<endpoint>& endpoints, const char* hostname,
-                                    unsigned short port = 0);
+  YASIO__DECL static int resolve_v4(std::vector<endpoint>& endpoints, const char* hostname, unsigned short port = 0, int socktype = SOCK_STREAM);
 
   /// <summary>
   /// Resolve as ipv6 address only.
   /// </summary>
-  YASIO__DECL static int resolve_v6(std::vector<endpoint>& endpoints, const char* hostname,
-                                    unsigned short port = 0);
+  YASIO__DECL static int resolve_v6(std::vector<endpoint>& endpoints, const char* hostname, unsigned short port = 0, int socktype = SOCK_STREAM);
 
   /// <summary>
   /// Resolve as ipv4 address only and convert to V4MAPPED format.
   /// </summary>
-  YASIO__DECL static int resolve_v4to6(std::vector<endpoint>& endpoints, const char* hostname,
-                                       unsigned short port = 0);
+  YASIO__DECL static int resolve_v4to6(std::vector<endpoint>& endpoints, const char* hostname, unsigned short port = 0, int socktype = SOCK_STREAM);
 
   /// <summary>
   /// Force resolve all addres to ipv6 endpoints, IP4 with AI_V4MAPPED
   /// </summary>
-  YASIO__DECL static int force_resolve_v6(std::vector<endpoint>& endpoints, const char* hostname,
-                                          unsigned short port = 0);
+  YASIO__DECL static int resolve_tov6(std::vector<endpoint>& endpoints, const char* hostname, unsigned short port = 0, int socktype = SOCK_STREAM);
 
   /// <summary>
   /// Resolve as ipv4 or ipv6 endpoints with callback
   /// </summary>
   template <typename _Fty>
-  inline static int resolve_i(const _Fty& callback, const char* hostname, unsigned short port = 0,
-                              int af = 0, int flags = 0)
+  inline static int resolve_i(const _Fty& callback, const char* hostname, unsigned short port = 0, int af = 0, int flags = 0, int socktype = SOCK_STREAM)
   {
     addrinfo hint;
     memset(&hint, 0x0, sizeof(hint));
-    hint.ai_family = af;
-    hint.ai_flags  = flags;
+    hint.ai_flags    = flags;
+    hint.ai_family   = af;
+    hint.ai_socktype = socktype;
 
     addrinfo* answerlist        = nullptr;
     char buffer[sizeof "65535"] = {'\0'};
@@ -982,11 +1137,11 @@ public:
     if (nullptr == answerlist)
       return error;
 
-    for (auto answer = answerlist; answer != nullptr; answer = answer->ai_next)
+    for (auto ai = answerlist; ai != nullptr; ai = ai->ai_next)
     {
-      if (answer->ai_family == AF_INET6 || answer->ai_family == AF_INET)
+      if (ai->ai_family == AF_INET6 || ai->ai_family == AF_INET)
       {
-        if (callback(endpoint(answer)))
+        if (callback(endpoint(ai)))
           break;
       }
     }
@@ -996,56 +1151,61 @@ public:
     return error;
   }
 
+  /*
+  ** @brief:: Gets supported internet protocol versions of localhost
+  ** @returns:
+  **  ipsv_unavailable: The network unavailable.
+  **  ipsv_ipv4: Support ipv4 only.
+  **  ipsv_ipv6: Support ipv6 only.
+  **  ipsv_dual_stack:
+  **    Support ipv4 or ipv6, but for multi network adapters device, you should always
+  **    use ipv4 preferred, such as smart phone with wifi & cellular network. The smart phone's os
+  **    will choose wifi when it is available to avoid consume user's cash, when the cellular
+  *support
+  **    ipv6/ipv4 but the wifi only support ipv4, then use ipv6 will cause network issue.
+  **    For more detail, see: https://github.com/halx99/yasio/issues/130
+  */
+  YASIO__DECL static int getipsv(void);
+
+  /*
+  ** @brief: Traverse local device network adapter address with valid ip
+  ** @params:
+  **  handler: prototype is [](const ip::endpoint& ep)->bool
+  */
+  YASIO__DECL static void traverse_local_address(std::function<bool(const ip::endpoint&)> handler);
+
+protected:
+  YASIO__DECL static void reregister_descriptor(socket_native_type s, fd_set* fds);
+
 private:
   socket_native_type fd;
 }; // namespace inet
-
-template <typename T> inline int xxsocket::set_optval(int level, int optname, const T& optval)
-{
-  return set_optval(this->fd, level, optname, optval);
-}
-
-template <typename T>
-inline int xxsocket::get_optval(int level, int optname, T& optval, socklen_t optlen) const
-{
-  return get_optval(this->fd, level, optname, optval, optlen);
-}
-
-template <typename T>
-inline int xxsocket::set_optval(socket_native_type s, int level, int optname, const T& optval)
-{
-  return ::setsockopt(s, level, optname, (const char*)&optval, sizeof(T));
-}
-
-template <typename T>
-inline int xxsocket::get_optval(socket_native_type s, int level, int optname, T& optval,
-                                socklen_t optlen)
-{
-  return ::getsockopt(s, level, optname, (char*)&optval, &optlen);
-}
-
-template <typename _T> inline int xxsocket::ioctl(long cmd, const _T& value) const
-{
-  return xxsocket::ioctl(this->fd, cmd, value);
-}
-
-template <typename _T> inline int xxsocket::ioctl(socket_native_type s, long cmd, const _T& value)
-{
-  u_long argp = value;
-  return ::ioctlsocket(s, cmd, &argp);
-}
 
 } // namespace inet
 
 namespace net = inet;
 } // namespace yasio
 
+namespace std
+{ // VS2013 the operator must be at namespace std
+inline bool operator<(const yasio::inet::ip::endpoint& lhs, const yasio::inet::ip::endpoint& rhs)
+{ // apply operator < to operands
+  if (lhs.af() == AF_INET)
+    return (static_cast<uint64_t>(lhs.in4_.sin_addr.s_addr) + lhs.in4_.sin_port) < (static_cast<uint64_t>(rhs.in4_.sin_addr.s_addr) + rhs.in4_.sin_port);
+  return ::memcmp(&lhs, &rhs, sizeof(rhs)) < 0;
+}
+inline bool operator==(const yasio::inet::ip::endpoint& lhs, const yasio::inet::ip::endpoint& rhs)
+{ // apply operator == to operands
+  return !(lhs < rhs) && !(rhs < lhs);
+}
+} // namespace std
+
 #if defined(_MSC_VER)
 #  pragma warning(pop)
 #endif
 
 #if defined(YASIO_HEADER_ONLY)
-#  include "yasio/xxsocket.cpp"
+#  include "yasio/xxsocket.cpp" // lgtm [cpp/include-non-header]
 #endif
 
 #endif
