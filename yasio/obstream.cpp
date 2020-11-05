@@ -5,7 +5,7 @@
 /*
 The MIT License (MIT)
 
-Copyright (c) 2012-2019 halx99
+Copyright (c) 2012-2020 HALX99
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -36,7 +36,7 @@ SOFTWARE.
 namespace yasio
 {
 
-obstream::obstream(size_t buffersize) { buffer_.reserve(buffersize); }
+obstream::obstream(size_t capacity) { buffer_.reserve(capacity); }
 
 void obstream::push8()
 {
@@ -46,13 +46,13 @@ void obstream::push8()
 void obstream::pop8()
 {
   auto offset = offset_stack_.top();
-  set(offset, static_cast<uint8_t>(buffer_.size() - offset - sizeof(uint8_t)));
+  pwrite_ix(offset, static_cast<uint8_t>(buffer_.size() - offset - sizeof(uint8_t)));
   offset_stack_.pop();
 }
 void obstream::pop8(uint8_t value)
 {
   auto offset = offset_stack_.top();
-  set(offset, value);
+  pwrite_ix(offset, value);
   offset_stack_.pop();
 }
 
@@ -64,13 +64,13 @@ void obstream::push16()
 void obstream::pop16()
 {
   auto offset = offset_stack_.top();
-  set(offset, static_cast<uint16_t>(buffer_.size() - offset - sizeof(uint16_t)));
+  pwrite_ix(offset, static_cast<uint16_t>(buffer_.size() - offset - sizeof(uint16_t)));
   offset_stack_.pop();
 }
 void obstream::pop16(uint16_t value)
 {
   auto offset = offset_stack_.top();
-  set(offset, value);
+  pwrite_ix(offset, value);
   offset_stack_.pop();
 }
 
@@ -105,14 +105,14 @@ void obstream::push32()
 void obstream::pop32()
 {
   auto offset = offset_stack_.top();
-  set(offset, static_cast<uint32_t>(buffer_.size() - offset - sizeof(uint32_t)));
+  pwrite_ix(offset, static_cast<uint32_t>(buffer_.size() - offset - sizeof(uint32_t)));
   offset_stack_.pop();
 }
 
 void obstream::pop32(uint32_t value)
 {
   auto offset = offset_stack_.top();
-  set(offset, value);
+  pwrite_ix(offset, value);
   offset_stack_.pop();
 }
 
@@ -134,35 +134,37 @@ obstream& obstream::operator=(obstream&& right)
   return *this;
 }
 
-void obstream::write_i24(uint32_t value)
+void obstream::write_i24(int32_t value) { write_u24(value); }
+
+void obstream::write_u24(uint32_t value)
 {
   value = htonl(value) >> 8;
   write_bytes(&value, 3);
 }
 
-void obstream::write_i7(int value)
+void obstream::write_i(int value)
 {
   // Write out an int 7 bits at a time.  The high bit of the byte,
   // when on, tells reader to continue reading more bytes.
   uint32_t v = (uint32_t)value; // support negative numbers
   while (v >= 0x80)
   {
-    write_i<uint8_t>((uint8_t)(v | 0x80));
+    write_byte((uint8_t)(v | 0x80));
     v >>= 7;
   }
-  write_i<uint8_t>((uint8_t)v);
+  write_byte((uint8_t)v);
 }
 
-void obstream::write_va(cxx17::string_view sv)
+void obstream::write_v(cxx17::string_view sv)
 {
   int len = static_cast<int>(sv.length());
-  write_i7(len);
+  write_i(len);
   write_bytes(sv.data(), len);
 }
 
-void obstream::write_v(cxx17::string_view value)
+void obstream::write_v32(cxx17::string_view value)
 {
-  write_v(value.data(), static_cast<int>(value.size()));
+  write_v32(value.data(), static_cast<int>(value.size()));
 }
 void obstream::write_v16(cxx17::string_view value)
 {
@@ -173,23 +175,25 @@ void obstream::write_v8(cxx17::string_view value)
   write_v8(value.data(), static_cast<int>(value.size()));
 }
 
-void obstream::write_v(const void* v, int size) { write_vx<uint32_t>(v, size); }
+void obstream::write_v32(const void* v, int size) { write_vx<uint32_t>(v, size); }
 void obstream::write_v16(const void* v, int size) { write_vx<uint16_t>(v, size); }
 void obstream::write_v8(const void* v, int size) { write_vx<uint8_t>(v, size); }
+
+void obstream::write_byte(uint8_t v) { buffer_.push_back(v); }
 
 void obstream::write_bytes(cxx17::string_view v)
 {
   return write_bytes(v.data(), static_cast<int>(v.size()));
 }
-
 void obstream::write_bytes(const void* v, int vl)
 {
   if (vl > 0)
-  {
-    auto offset = buffer_.size();
-    buffer_.resize(buffer_.size() + vl);
+    buffer_.insert(buffer_.end(), (const char*)v, (const char*)v + vl);
+}
+void obstream::write_bytes(std::streamoff offset, const void* v, int vl)
+{
+  if ((offset + vl) < static_cast<std::streamoff>(buffer_.size()))
     ::memcpy(buffer_.data() + offset, v, vl);
-  }
 }
 
 void obstream::save(const char* filename)

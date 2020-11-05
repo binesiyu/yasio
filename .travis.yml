@@ -1,15 +1,28 @@
 language: cpp
-os:
-  - linux
-  - osx
-compiler:
-  - clang
-  - gcc
-
-matrix:
-  exclude:
+jobs:
+  include:
     - os: osx
-      compiler: gcc
+      osx_image: xcode11
+      env: 
+        - BUILD_TARGET=osx
+    - os: linux
+      env: 
+        - BUILD_TARGET=linux
+    - os: freebsd
+      compiler: clang
+      env:
+        - BUILD_TARGET=freebsd
+    - os: osx
+      osx_image: xcode11
+      env: 
+        - BUILD_TARGET=ios
+    - os: linux
+      env:
+        - BUILD_TARGET=android
+        - NDK_VER=r16b
+
+install:
+  - travis/install.sh
 
 script:
-  - make cxxstd=c++11 config=release -j2
+  - travis/build.sh

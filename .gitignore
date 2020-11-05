@@ -4,6 +4,8 @@ ignored/*.*
 *.idb
 *.log
 *.obj
+*.so
+*.o
 *.lastbuildstate
 *.sdf
 *.tlog
@@ -19,3 +21,5 @@ ignored/*.*
 /.vs
 /.xs
 /build
+/.vscode
+/**/.DS_Store

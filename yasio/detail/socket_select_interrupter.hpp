@@ -2,41 +2,22 @@
 // A cross platform socket APIs, support ios & android & wp8 & window store universal app
 //
 //////////////////////////////////////////////////////////////////////////////////////////
-/*
-The MIT License (MIT)
-
-Copyright (c) 2012-2019 halx99
-
-Copyright (c) 2003-2015 Christopher M. Kohlhoff (chris at kohlhoff dot com)
-Copyright (c) 2008 Roelof Naude (roelof.naude at gmail dot com)
-
-Distributed under the Boost Software License, Version 1.0. (See accompanying
-file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-*/
+//
+// detail/socket_select_interrupter.hpp
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+//
+// Copyright (c) 2016-2020 halx99 (halx99 at live dot com)
+// Copyright (c) 2003-2020 Christopher M. Kohlhoff (chris at kohlhoff dot com)
+// Copyright (c) 2008 Roelof Naude (roelof.naude at gmail dot com)
+//
+// Distributed under the Boost Software License, Version 1.0. (See accompanying
+// file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
+//
+// see also: https://github.com/chriskohlhoff/asio
+//
 #ifndef YASIO__SOCKET_SELECT_INTERRUPTER_HPP
 #define YASIO__SOCKET_SELECT_INTERRUPTER_HPP
 #include "yasio/xxsocket.hpp"
-#if defined(_MSC_VER) && (_MSC_VER >= 1200)
-#  pragma once
-#endif // defined(_MSC_VER) && (_MSC_VER >= 1200)
 
 namespace yasio
 {
@@ -46,29 +27,91 @@ class socket_select_interrupter
 {
 public:
   // Constructor.
-  inline socket_select_interrupter();
+  inline socket_select_interrupter() { open_descriptors(); }
 
   // Destructor.
-  inline ~socket_select_interrupter();
+  inline ~socket_select_interrupter() { close_descriptors(); }
 
   // Recreate the interrupter's descriptors. Used after a fork.
-  inline void recreate();
+  inline void recreate()
+  {
+    close_descriptors();
+
+    write_descriptor_ = invalid_socket;
+    read_descriptor_  = invalid_socket;
+
+    open_descriptors();
+  }
 
   // Interrupt the select call.
-  inline void interrupt();
+  inline void interrupt() { xxsocket::send(write_descriptor_, "\0", 1); }
 
-  // Reset the select interrupt. Returns true if the call was interrupted.
-  inline bool reset();
+  // Reset the select interrupter. Returns true if the reset was successful.
+  inline bool reset()
+  {
+    char data[1024];
+    for (;;)
+    {
+      int bytes_read = xxsocket::recv(read_descriptor_, data, sizeof(data), 0);
+      if (bytes_read == sizeof(data))
+        continue;
+      if (bytes_read > 0)
+        return true;
+      if (bytes_read == 0)
+        return false;
+      int ec = xxsocket::get_last_errno();
+      if (ec == EINTR)
+        continue;
+      return (ec == EWOULDBLOCK || ec == EAGAIN);
+    }
+  }
 
   // Get the read descriptor to be passed to select.
   socket_native_type read_descriptor() const { return read_descriptor_; }
 
 private:
   // Open the descriptors. Throws on error.
-  inline void open_descriptors();
+  inline void open_descriptors()
+  {
+    xxsocket acceptor(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    acceptor.set_optval(SOL_SOCKET, SO_REUSEADDR, 1);
+
+    int error = 0;
+    ip::endpoint ep(INADDR_LOOPBACK);
+
+    error = acceptor.bind(ep);
+    ep    = acceptor.local_endpoint();
+    // Some broken firewalls on Windows will intermittently cause getsockname to
+    // return 0.0.0.0 when the socket is actually bound to 127.0.0.1. We
+    // explicitly specify the target address here to work around this problem.
+    if (INADDR_ANY == ep.addr_v4())
+      ep.addr_v4(INADDR_LOOPBACK);
+    error = acceptor.listen();
+
+    xxsocket client(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    error = client.connect(ep);
+
+    auto server = acceptor.accept();
+
+    client.set_nonblocking(true);
+    client.set_optval(IPPROTO_TCP, TCP_NODELAY, 1);
+
+    server.set_nonblocking(true);
+    server.set_optval(IPPROTO_TCP, TCP_NODELAY, 1);
+
+    read_descriptor_  = server.detach();
+    write_descriptor_ = client.detach();
+  }
 
   // Close the descriptors.
-  inline void close_descriptors();
+  inline void close_descriptors()
+  {
+    if (read_descriptor_ != invalid_socket)
+      ::closesocket(read_descriptor_);
+
+    if (write_descriptor_ != invalid_socket)
+      ::closesocket(write_descriptor_);
+  }
 
   // The read end of a connection used to interrupt the select call. This file
   // descriptor is passed to select such that when it is time to stop, a single
@@ -84,7 +127,5 @@ private:
 
 } // namespace inet
 } // namespace yasio
-
-#include "socket_select_interrupter.ipp"
 
 #endif // YASIO__SOCKET_SELECT_INTERRUPTER_HPP

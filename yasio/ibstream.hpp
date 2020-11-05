@@ -5,7 +5,7 @@
 /*
 The MIT License (MIT)
 
-Copyright (c) 2012-2019 halx99
+Copyright (c) 2012-2020 HALX99
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -32,8 +32,8 @@ SOFTWARE.
 #include <sstream>
 #include <exception>
 #include <vector>
-#include "yasio/detail/string_view.hpp"
-#include "yasio/detail/endian_portable.h"
+#include "yasio/cxx17/string_view.hpp"
+#include "yasio/detail/endian_portable.hpp"
 #include "yasio/detail/config.hpp"
 namespace yasio
 {
@@ -42,46 +42,43 @@ class ibstream_view
 {
 public:
   YASIO__DECL ibstream_view();
-  YASIO__DECL ibstream_view(const void* data, int size);
+  YASIO__DECL ibstream_view(const void* data, size_t size);
   YASIO__DECL ibstream_view(const obstream*);
-  YASIO__DECL ibstream_view(const ibstream_view& right) = delete;
-  YASIO__DECL ibstream_view(ibstream_view&& right)      = delete;
+  YASIO__DECL ibstream_view(const ibstream_view&) = delete;
+  YASIO__DECL ibstream_view(ibstream_view&&)      = delete;
 
   YASIO__DECL ~ibstream_view();
 
-  YASIO__DECL void assign(const void* data, int size);
+  YASIO__DECL void reset(const void* data, size_t size);
 
-  YASIO__DECL ibstream_view& operator=(const ibstream_view& right) = delete;
-  YASIO__DECL ibstream_view& operator=(ibstream_view&& right) = delete;
+  YASIO__DECL ibstream_view& operator=(const ibstream_view&) = delete;
+  YASIO__DECL ibstream_view& operator=(ibstream_view&&) = delete;
 
-  template <typename _Nty> inline void read_ix(_Nty& ov);
-
-  template <typename _Nty> inline _Nty read_i()
-  {
-    _Nty value;
-    read_ix(value);
-    return value;
-  }
-
-  YASIO__DECL int read_i7();
+  /* write 7bit encoded variant integer value
+  ** @.net BinaryReader.Read7BitEncodedInt
+  */
+  YASIO__DECL int read_i();
 
   YASIO__DECL int32_t read_i24();
   YASIO__DECL uint32_t read_u24();
 
-  YASIO__DECL cxx17::string_view read_va();
+  /* read blob data with '7bit encoded int' length field */
+  YASIO__DECL cxx17::string_view read_v();
 
-  YASIO__DECL void read_v(std::string&);   // 32 bits length field
+  YASIO__DECL void read_v32(std::string&); // 32 bits length field
   YASIO__DECL void read_v16(std::string&); // 16 bits length field
   YASIO__DECL void read_v8(std::string&);  // 8 bits length field
 
-  YASIO__DECL void read_v(void*, int);
+  YASIO__DECL void read_v32(void*, int);
   YASIO__DECL void read_v16(void*, int);
   YASIO__DECL void read_v8(void*, int);
+
+  YASIO__DECL uint8_t read_byte();
 
   YASIO__DECL void read_bytes(std::string& oav, int len);
   YASIO__DECL void read_bytes(void* oav, int len);
 
-  YASIO__DECL cxx17::string_view read_v();
+  YASIO__DECL cxx17::string_view read_v32();
   YASIO__DECL cxx17::string_view read_v16();
   YASIO__DECL cxx17::string_view read_v8();
 
@@ -92,20 +89,27 @@ public:
 
   YASIO__DECL ptrdiff_t seek(ptrdiff_t offset, int whence);
 
+  template <typename _Nty> inline _Nty read_ix() { return sread_ix<_Nty>(consume(sizeof(_Nty))); }
+
+  template <typename _Nty> static _Nty sread_ix(const void* src)
+  {
+    _Nty value;
+    ::memcpy(&value, src, sizeof(value));
+    return yasio::endian::ntohv(value);
+  }
+
   template <typename _LenT> inline cxx17::string_view read_vx()
   {
-    _LenT n = read_i<_LenT>();
+    _LenT n = read_ix<_LenT>();
 
     if (n > 0)
-    {
       return read_bytes(n);
-    }
 
     return {};
   }
 
 protected:
-  // will throw std::logic_error
+  // will throw std::out_of_range
   YASIO__DECL const char* consume(size_t size);
 
 protected:
@@ -114,29 +118,18 @@ protected:
   const char* ptr_;
 };
 
-template <typename _Nty> inline void ibstream_view::read_ix(_Nty& ov)
-{
-  memcpy(&ov, consume(sizeof(ov)), sizeof(ov));
-  ov = yasio::endian::ntohv(ov);
-}
-
-template <> inline void ibstream_view::read_ix<uint8_t>(uint8_t& ov)
-{
-  memcpy(&ov, consume(sizeof(ov)), sizeof(ov));
-}
-
-template <> inline void ibstream_view::read_ix<float>(float& ov)
+template <> inline float ibstream_view::sread_ix<float>(const void* src)
 {
   uint32_t nv;
-  memcpy(&nv, consume(sizeof(nv)), sizeof(nv));
-  ov = ntohf(nv);
+  ::memcpy(&nv, src, sizeof(nv));
+  return ntohf(nv);
 }
 
-template <> inline void ibstream_view::read_ix<double>(double& ov)
+template <> inline double ibstream_view::sread_ix<double>(const void* src)
 {
   uint64_t nv;
-  memcpy(&nv, consume(sizeof(nv)), sizeof(nv));
-  ov = ntohd(nv);
+  ::memcpy(&nv, src, sizeof(nv));
+  return ntohd(nv);
 }
 
 /// --------------------- CLASS ibstream ---------------------
@@ -153,7 +146,7 @@ private:
 } // namespace yasio
 
 #if defined(YASIO_HEADER_ONLY)
-#  include "yasio/ibstream.cpp"
+#  include "yasio/ibstream.cpp" // lgtm [cpp/include-non-header]
 #endif
 
 #endif
